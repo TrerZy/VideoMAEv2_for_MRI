@@ -20,10 +20,13 @@ import deepspeed
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
+import timm
 from timm.data.mixup import Mixup
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.models import create_model
 from timm.utils import ModelEma
+
+import wandb
 
 # NOTE: Do not comment `import models`, it is used to register models
 import models  # noqa: F401
@@ -157,7 +160,7 @@ def get_args():
     parser.add_argument(
         '--warmup_lr',
         type=float,
-        default=1e-8,
+        default=1e-6,
         metavar='LR',
         help='warmup learning rate (default: 1e-6)')
     parser.add_argument(
@@ -318,7 +321,7 @@ def get_args():
         default='Kinetics-400',
         choices=[
             'Kinetics-400', 'Kinetics-600', 'Kinetics-700', 'SSV2', 'UCF101',
-            'HMDB51', 'Diving48', 'Kinetics-710', 'MIT'
+            'HMDB51', 'Diving48', 'Kinetics-710', 'MIT', 'MRI'
         ],
         type=str,
         help='dataset')
@@ -391,6 +394,18 @@ def get_args():
 
     parser.add_argument(
         '--enable_deepspeed', action='store_true', default=False)
+    
+    parser.add_argument(
+        '--enable_wandb', action='store_true', default=False)
+    
+    parser.add_argument(
+        '--log_info', default='test', type=str)
+    
+    parser.add_argument(
+        '--gpu_num', default=1, type=int)
+    
+    parser.add_argument(
+        '--ratio', default='1', type=str)
 
     known_args, _ = parser.parse_known_args()
 
@@ -413,6 +428,50 @@ def main(args, ds_init):
 
     device = torch.device(args.device)
 
+    if args.enable_wandb and utils.get_rank() == 0:
+
+        wandb.login(key="5ea59caf6cf68a5d32d6b522ca73334060c46b18")
+
+        wandb.init(
+            project="MRI_narcotize_video_videomae",  # 项目名称
+            name=f"{args.log_info}",          # 运行的名称（可选）
+            config={                      # 记录超参数信息
+                "learning_rate": args.lr,
+                "drop_path": args.drop_path,
+                "layer_decay": args.layer_decay,
+                "weight_decay": args.weight_decay,
+                "class_ratio": f'{args.ratio}:1',
+                "total_batch_size": args.batch_size * args.gpu_num,
+                "epochs": args.epochs,
+                "warmup_epochs": args.warmup_epochs,
+                "input_size": args.input_size,
+                "model": args.model,
+            }
+        )
+
+        wandb.define_metric("epoch") 
+
+        wandb.define_metric("Train/train_loss", step_metric="epoch")
+        wandb.define_metric("Train/train_AUC", step_metric="epoch")
+        wandb.define_metric("Train/train_acc", step_metric="epoch")
+        wandb.define_metric("Train/train_TP", step_metric="epoch")
+        wandb.define_metric("Train/train_TN", step_metric="epoch")
+        wandb.define_metric("Train/train_FP", step_metric="epoch")
+        wandb.define_metric("Train/train_FN", step_metric="epoch")
+        wandb.define_metric("Train/learning_rate", step_metric="epoch")
+
+        wandb.define_metric("Val/val_loss", step_metric="epoch")
+        wandb.define_metric("Val/val_AUC", step_metric="epoch")
+        wandb.define_metric("Val/val_acc", step_metric="epoch")
+        wandb.define_metric("Val/val_TP", step_metric="epoch")
+        wandb.define_metric("Val/val_TN", step_metric="epoch")
+        wandb.define_metric("Val/val_FP", step_metric="epoch")
+        wandb.define_metric("Val/val_FN", step_metric="epoch")
+        # wandb.define_metric("Test/test_loss")
+        # wandb.define_metric("Test/test_AUC")
+        # wandb.define_metric("Test/test_acc")
+
+
     # fix the seed for reproducibility
     seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
@@ -427,7 +486,7 @@ def main(args, ds_init):
     else:
         dataset_val, _ = build_dataset(
             is_train=False, test_mode=False, args=args)
-    dataset_test, _ = build_dataset(is_train=False, test_mode=True, args=args)
+    # dataset_test, _ = build_dataset(is_train=False, test_mode=True, args=args)
 
     num_tasks = utils.get_world_size()
     global_rank = utils.get_rank()
@@ -445,11 +504,11 @@ def main(args, ds_init):
             num_replicas=num_tasks,
             rank=global_rank,
             shuffle=False)
-        sampler_test = torch.utils.data.DistributedSampler(
-            dataset_test,
-            num_replicas=num_tasks,
-            rank=global_rank,
-            shuffle=False)
+        # sampler_test = torch.utils.data.DistributedSampler(
+        #     dataset_test,
+        #     num_replicas=num_tasks,
+        #     rank=global_rank,
+        #     shuffle=False)
     else:
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
@@ -486,17 +545,17 @@ def main(args, ds_init):
     else:
         data_loader_val = None
 
-    if dataset_test is not None:
-        data_loader_test = torch.utils.data.DataLoader(
-            dataset_test,
-            sampler=sampler_test,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            pin_memory=args.pin_mem,
-            drop_last=False,
-            persistent_workers=True)
-    else:
-        data_loader_test = None
+    # if dataset_test is not None:
+    #     data_loader_test = torch.utils.data.DataLoader(
+    #         dataset_test,
+    #         sampler=sampler_test,
+    #         batch_size=args.batch_size,
+    #         num_workers=args.num_workers,
+    #         pin_memory=args.pin_mem,
+    #         drop_last=False,
+    #         persistent_workers=True)
+    # else:
+    #     data_loader_test = None
 
     mixup_fn = None
     mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
@@ -542,6 +601,8 @@ def main(args, ds_init):
         if args.finetune.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.finetune, map_location='cpu', check_hash=True)
+        # elif args.finetune == 'ImageNet_1k': 
+        #         
         else:
             checkpoint = torch.load(args.finetune, map_location='cpu')
 
@@ -591,46 +652,87 @@ def main(args, ds_init):
         checkpoint_model = new_dict
 
         # interpolate position embedding
-        if 'pos_embed' in checkpoint_model:
-            pos_embed_checkpoint = checkpoint_model['pos_embed']
-            embedding_size = pos_embed_checkpoint.shape[-1]  # channel dim
-            num_patches = model.patch_embed.num_patches  #
-            num_extra_tokens = model.pos_embed.shape[-2] - num_patches  # 0/1
+        # if 'pos_embed' in checkpoint_model:
+        #     pos_embed_checkpoint = checkpoint_model['pos_embed']
+        #     embedding_size = pos_embed_checkpoint.shape[-1]  # channel dim
+        #     num_patches = model.patch_embed.num_patches  #
+        #     num_extra_tokens = model.pos_embed.shape[-2] - num_patches  # 0/1
 
-            # height (== width) for the checkpoint position embedding
-            orig_size = int(
-                ((pos_embed_checkpoint.shape[-2] - num_extra_tokens) //
-                 (args.num_frames // model.patch_embed.tubelet_size))**0.5)
-            # height (== width) for the new position embedding
-            new_size = int(
-                (num_patches //
-                 (args.num_frames // model.patch_embed.tubelet_size))**0.5)
-            # class_token and dist_token are kept unchanged
-            if orig_size != new_size:
-                print("Position interpolate from %dx%d to %dx%d" %
-                      (orig_size, orig_size, new_size, new_size))
-                extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
-                # only the position tokens are interpolated
-                pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
-                # B, L, C -> BT, H, W, C -> BT, C, H, W
-                pos_tokens = pos_tokens.reshape(
-                    -1, args.num_frames // model.patch_embed.tubelet_size,
-                    orig_size, orig_size, embedding_size)
-                pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size,
-                                                embedding_size).permute(
-                                                    0, 3, 1, 2)
-                pos_tokens = torch.nn.functional.interpolate(
-                    pos_tokens,
-                    size=(new_size, new_size),
-                    mode='bicubic',
-                    align_corners=False)
-                # BT, C, H, W -> BT, H, W, C ->  B, T, H, W, C
-                pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(
-                    -1, args.num_frames // model.patch_embed.tubelet_size,
-                    new_size, new_size, embedding_size)
-                pos_tokens = pos_tokens.flatten(1, 3)  # B, L, C
-                new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
-                checkpoint_model['pos_embed'] = new_pos_embed
+        #     # height (== width) for the checkpoint position embedding
+        #     orig_size = int(
+        #         ((pos_embed_checkpoint.shape[-2] - num_extra_tokens) //
+        #          (args.num_frames // model.patch_embed.tubelet_size))**0.5)
+        #     # height (== width) for the new position embedding
+        #     new_size = int(
+        #         (num_patches //
+        #          (args.num_frames // model.patch_embed.tubelet_size))**0.5)
+        #     # class_token and dist_token are kept unchanged
+        #     if orig_size != new_size:
+        #         print("Position interpolate from %dx%d to %dx%d" %
+        #               (orig_size, orig_size, new_size, new_size))
+        #         extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
+        #         # only the position tokens are interpolated
+        #         pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
+        #         # B, L, C -> BT, H, W, C -> BT, C, H, W
+        #         pos_tokens = pos_tokens.reshape(
+        #             -1, args.num_frames // model.patch_embed.tubelet_size,
+        #             orig_size, orig_size, embedding_size)
+        #         pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size,
+        #                                         embedding_size).permute(
+        #                                             0, 3, 1, 2)
+        #         pos_tokens = torch.nn.functional.interpolate(
+        #             pos_tokens,
+        #             size=(new_size, new_size),
+        #             mode='bicubic',
+        #             align_corners=False)
+        #         # BT, C, H, W -> BT, H, W, C ->  B, T, H, W, C
+        #         pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(
+        #             -1, args.num_frames // model.patch_embed.tubelet_size,
+        #             new_size, new_size, embedding_size)
+        #         pos_tokens = pos_tokens.flatten(1, 3)  # B, L, C
+        #         new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
+        #         checkpoint_model['pos_embed'] = new_pos_embed
+        
+        if 'pos_embed' in checkpoint_model:
+            print(f"Interpolating positional embedding...")
+
+            pos_embed_checkpoint = checkpoint_model['pos_embed']  # shape: [1, L, C]
+            embedding_size = pos_embed_checkpoint.shape[-1]  # C
+            num_patches = model.patch_embed.num_patches
+            num_extra_tokens = model.pos_embed.shape[1] - num_patches  # usually 1 (cls_token)
+
+            # Calculate original spatial/temporal size
+            orig_T = 16 // model.patch_embed.tubelet_size
+            orig_size = int(((pos_embed_checkpoint.shape[1] - num_extra_tokens) // orig_T) ** 0.5)
+
+            new_T = args.num_frames // model.patch_embed.tubelet_size
+            new_size = int((num_patches // new_T) ** 0.5)
+
+            print(f"Orig size: {orig_size}x{orig_size}x{orig_T}, New size: {new_size}x{new_size}x{new_T}")
+
+            # Extra tokens (e.g., cls token)
+            extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
+
+            # Reshape pos tokens
+            pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
+            pos_tokens = pos_tokens.reshape(1, orig_T, orig_size, orig_size, embedding_size)
+            pos_tokens = pos_tokens.permute(0, 4, 1, 2, 3)  # B, C, T, H, W
+
+            # Interpolate temporal + spatial
+            pos_tokens = torch.nn.functional.interpolate(
+                pos_tokens, 
+                size=(new_T, new_size, new_size), 
+                mode='trilinear', 
+                align_corners=False
+            )
+
+            pos_tokens = pos_tokens.permute(0, 2, 3, 4, 1).reshape(1, new_T * new_size * new_size, embedding_size)
+
+            # Combine
+            new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
+
+            checkpoint_model['pos_embed'] = new_pos_embed
+
         elif args.input_size != 224:
             pos_tokens = model.pos_embed
             org_num_frames = 16
@@ -651,22 +753,53 @@ def main(args, ds_init):
                                             1).reshape(-1, T, new_P, new_P, C)
             pos_tokens = pos_tokens.flatten(1, 3)  # B, L, C
             model.pos_embed = pos_tokens  # update
-        if args.num_frames != 16:
-            org_num_frames = 16
-            T = org_num_frames // args.tubelet_size
-            pos_tokens = model.pos_embed
-            new_T = args.num_frames // args.tubelet_size
-            P = int((pos_tokens.shape[1] // T)**0.5)
-            C = pos_tokens.shape[2]
-            pos_tokens = pos_tokens.reshape(-1, T, P, P, C)
-            pos_tokens = pos_tokens.permute(0, 2, 3, 4,
-                                            1).reshape(-1, C, T)  # BHW,C,T
-            pos_tokens = torch.nn.functional.interpolate(
-                pos_tokens, size=new_T, mode='linear')
-            pos_tokens = pos_tokens.reshape(1, P, P, C,
-                                            new_T).permute(0, 4, 1, 2, 3)
-            pos_tokens = pos_tokens.flatten(1, 3)
-            model.pos_embed = pos_tokens  # update
+
+
+        # if args.num_frames != 16:
+        #     print(f"Interpolating temporal position embedding: pretrain_num_frames=16 → target_num_frames={args.num_frames}")
+            
+        #     pos_tokens = model.pos_embed  # Shape: [1, num_patches+1, embed_dim]
+        #     # Extract important parameters
+        #     B, L, C = pos_tokens.shape
+        #     tubelet_size = model.patch_embed.tubelet_size
+        #     org_num_frames = 16
+        #     T_pretrain = org_num_frames // tubelet_size
+        #     T_target = args.num_frames // tubelet_size
+        #     P = int((L // T_pretrain) ** 0.5)
+
+        #     print(f"Original T: {T_pretrain}, Target T: {T_target}, Patch size: {P}, Embedding dim: {C}")
+
+        #     # Reshape pos_tokens
+        #     pos_tokens = pos_tokens.reshape(-1, T_pretrain, P, P, C)
+        #     pos_tokens = pos_tokens.permute(0, 2, 3, 4, 1)  # (B, P, P, C, T)
+
+        #     # Interpolate temporal dimension
+        #     pos_tokens = torch.nn.functional.interpolate(
+        #         pos_tokens, size=T_target, mode='linear', align_corners=False
+        #     )
+
+        #     pos_tokens = pos_tokens.permute(0, 4, 1, 2, 3).reshape(1, T_target * P * P, C)  # (B, L_new, C)
+            
+        #     model.pos_embed = pos_tokens  # update
+
+        
+        # if args.num_frames != 16:
+        #     org_num_frames = 16
+        #     T = org_num_frames // args.tubelet_size
+        #     pos_tokens = model.pos_embed
+        #     new_T = args.num_frames // args.tubelet_size
+        #     P = int((pos_tokens.shape[1] // T)**0.5)
+        #     C = pos_tokens.shape[2]
+        #     pos_tokens = pos_tokens.reshape(-1, T, P, P, C)
+        #     pos_tokens = pos_tokens.permute(0, 2, 3, 4,
+        #                                     1).reshape(-1, C, T)  # BHW,C,T
+        #     pos_tokens = torch.nn.functional.interpolate(
+        #         pos_tokens, size=new_T, mode='linear')
+        #     pos_tokens = pos_tokens.reshape(1, P, P, C,
+        #                                     new_T).permute(0, 4, 1, 2, 3)
+        #     pos_tokens = pos_tokens.flatten(1, 3)
+        #     model.pos_embed = pos_tokens  # update
+
 
         utils.load_state_dict(
             model, checkpoint_model, prefix=args.model_prefix)
@@ -785,36 +918,38 @@ def main(args, ds_init):
         optimizer=optimizer,
         loss_scaler=loss_scaler,
         model_ema=model_ema)
-    if args.validation:
-        test_stats = validation_one_epoch(data_loader_val, model, device)
-        print(
-            f"{len(dataset_val)} val images: Top-1 {test_stats['acc1']:.2f}%, Top-5 {test_stats['acc5']:.2f}%, loss {test_stats['loss']:.4f}"
-        )
-        exit(0)
+    
+    # if args.validation:
+    #     test_stats = validation_one_epoch(data_loader_val, model, device)
+    #     print(
+    #         f"{len(dataset_val)} val images: Top-1 {test_stats['acc1']:.2f}%, Top-5 {test_stats['acc5']:.2f}%, loss {test_stats['loss']:.4f}"
+    #     )
+    #     exit(0)
 
-    if args.eval:
-        preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
-        test_stats = final_test(data_loader_test, model, device, preds_file)
-        torch.distributed.barrier()
-        if global_rank == 0:
-            print("Start merging results...")
-            final_top1, final_top5 = merge(args.output_dir, num_tasks)
-            print(
-                f"Accuracy of the network on the {len(dataset_test)} test videos: Top-1: {final_top1:.2f}%, Top-5: {final_top5:.2f}%"
-            )
-            log_stats = {'Final top-1': final_top1, 'Final Top-5': final_top5}
-            if args.output_dir and utils.is_main_process():
-                with open(
-                        os.path.join(args.output_dir, "log.txt"),
-                        mode="a",
-                        encoding="utf-8") as f:
-                    f.write(json.dumps(log_stats) + "\n")
-        exit(0)
+    # if args.eval:
+    #     preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
+    #     test_stats = final_test(data_loader_test, model, device, preds_file)
+    #     torch.distributed.barrier()
+    #     if global_rank == 0:
+    #         print("Start merging results...")
+    #         final_top1, final_top5 = merge(args.output_dir, num_tasks)
+    #         print(
+    #             f"Accuracy of the network on the {len(dataset_test)} test videos: Top-1: {final_top1:.2f}%, Top-5: {final_top5:.2f}%"
+    #         )
+    #         log_stats = {'Final top-1': final_top1, 'Final Top-5': final_top5}
+    #         if args.output_dir and utils.is_main_process():
+    #             with open(
+    #                     os.path.join(args.output_dir, "log.txt"),
+    #                     mode="a",
+    #                     encoding="utf-8") as f:
+    #                 f.write(json.dumps(log_stats) + "\n")
+    #     exit(0)
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
-    max_accuracy = 0.0
+    max_AUC = 0.0
     for epoch in range(args.start_epoch, args.epochs):
+
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
         if log_writer is not None:
@@ -851,11 +986,9 @@ def main(args, ds_init):
                     model_ema=model_ema)
         if data_loader_val is not None:
             test_stats = validation_one_epoch(data_loader_val, model, device)
-            print(
-                f"Accuracy of the network on the {len(dataset_val)} val images: {test_stats['acc1']:.2f}%"
-            )
-            if max_accuracy < test_stats["acc1"]:
-                max_accuracy = test_stats["acc1"]
+            print(f"AUC of the network on the {len(dataset_val)} val images: {test_stats['AUC']:.3f}%")
+            if max_AUC < test_stats["AUC"]:
+                max_AUC = test_stats["AUC"]
                 if args.output_dir and args.save_ckpt:
                     utils.save_model(
                         args=args,
@@ -866,12 +999,12 @@ def main(args, ds_init):
                         epoch="best",
                         model_ema=model_ema)
 
-            print(f'Max accuracy: {max_accuracy:.2f}%')
+            print(f'Max AUC: {max_AUC:.3f}%')
             if log_writer is not None:
                 log_writer.update(
-                    val_acc1=test_stats['acc1'], head="perf", step=epoch)
+                    val_AUC=test_stats['AUC'], head="perf", step=epoch)
                 log_writer.update(
-                    val_acc5=test_stats['acc5'], head="perf", step=epoch)
+                    val_acc1=test_stats['acc1'], head="perf", step=epoch)
                 log_writer.update(
                     val_loss=test_stats['loss'], head="perf", step=epoch)
 
@@ -897,23 +1030,54 @@ def main(args, ds_init):
                     encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
-    preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
-    test_stats = final_test(data_loader_test, model, device, preds_file)
+        if args.enable_wandb and global_rank == 0:
+            wandb.log(
+                {
+                    "epoch": epoch, 
+                    "Train/train_AUC": train_stats['AUC'], 
+                    "Train/train_acc": train_stats['acc1'],
+                    "Train/train_loss": train_stats['loss'],
+                    "Train/train_TP": train_stats['TP'],
+                    "Train/train_TN": train_stats['TN'],
+                    "Train/train_FP": train_stats['FP'],
+                    "Train/train_FN": train_stats['FN'],
+                    "Train/learning_rate": train_stats['lr'],
+                    "Val/val_AUC": test_stats['AUC'],
+                    "Val/val_acc": test_stats['acc1'],
+                    "Val/val_loss": test_stats['loss'],
+                    "Val/val_TP": test_stats['TP'],
+                    "Val/val_TN": test_stats['TN'],
+                    "Val/val_FP": test_stats['FP'],
+                    "Val/val_FN": test_stats['FN']
+                }
+            )
+
+    # preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
+    # test_stats = final_test(data_loader_test, model, device, preds_file)
     torch.distributed.barrier()
 
-    if global_rank == 0:
-        print("Start merging results...")
-        final_top1, final_top5 = merge(args.output_dir, num_tasks)
-        print(
-            f"Accuracy of the network on the {len(dataset_test)} test videos: Top-1: {final_top1:.2f}%, Top-5: {final_top5:.2f}%"
-        )
-        log_stats = {'Final top-1': final_top1, 'Final Top-5': final_top5}
-        if args.output_dir and utils.is_main_process():
-            with open(
-                    os.path.join(args.output_dir, "log.txt"),
-                    mode="a",
-                    encoding="utf-8") as f:
-                f.write(json.dumps(log_stats) + "\n")
+    # if global_rank == 0:
+    #     print("Start merging results...")
+    #     final_top1, final_auc = merge(args.output_dir, num_tasks)
+    #     print(
+    #         f"AUC and Accuracy of the network on the {len(dataset_test)} test videos: AUC: {final_auc:.2f}%, ACC@1: {final_top1:.2f}%"
+    #     )
+    #     log_stats = {'Final AUC': final_auc, 'Final ACC@1': final_top1, 'Best AUC': max_AUC}
+    #     if args.output_dir and utils.is_main_process():
+    #         with open(
+    #                 os.path.join(args.output_dir, "log.txt"),
+    #                 mode="a",
+    #                 encoding="utf-8") as f:
+    #             f.write(json.dumps(log_stats) + "\n")
+
+    #     if args.enable_wandb:
+    #         wandb.log(
+    #             {
+    #                 "Test/test_AUC": test_stats['AUC'],
+    #                 "Test/test_acc": test_stats['acc1'],
+    #                 "Test/test_loss": test_stats['loss']
+    #             }
+    #         )
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

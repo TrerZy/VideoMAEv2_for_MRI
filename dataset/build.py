@@ -164,6 +164,27 @@ def build_dataset(is_train, test_mode, args):
 
         nb_classes = 174
 
+    elif args.data_set == 'MRI':
+        dataset = RawFrameClsDataset(
+            anno_path=anno_path,
+            data_root=args.data_root,
+            mode=mode,
+            clip_len=1,
+            num_segment=args.num_frames,
+            test_num_segment=args.test_num_segment,
+            test_num_crop=args.test_num_crop,
+            num_crop=1,
+            keep_aspect_ratio=True,
+            crop_size=args.input_size,
+            short_side_size=args.short_side_size,
+            new_height=256,
+            new_width=320,
+            filename_tmpl=args.fname_tmpl,
+            start_idx=args.start_idx,
+            args=args)
+
+        nb_classes = 2
+
     elif args.data_set == 'UCF101':
         dataset = VideoClsDataset(
             anno_path=anno_path,

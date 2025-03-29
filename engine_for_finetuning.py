@@ -19,9 +19,15 @@ from timm.utils import ModelEma, accuracy
 
 import utils
 
+from sklearn.metrics import roc_auc_score
+import torch.nn.functional as F
+import torch.distributed as dist
+
+import wandb
 
 def train_class_batch(model, samples, target, criterion):
     outputs = model(samples)
+    assert target.min() >= 0 and target.max() < 2
     loss = criterion(outputs, target)
     return loss, outputs
 
@@ -55,7 +61,7 @@ def train_one_epoch(model: torch.nn.Module,
     metric_logger.add_meter(
         'min_lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
-    print_freq = 20
+    print_freq = 1
 
     if loss_scaler is None:
         model.zero_grad()
@@ -63,8 +69,11 @@ def train_one_epoch(model: torch.nn.Module,
     else:
         optimizer.zero_grad()
 
-    for data_iter_step, (samples, targets, _, _) in enumerate(
-            metric_logger.log_every(data_loader, print_freq, header)):
+    all_targets = []
+    all_probs = []
+
+    for data_iter_step, (samples, targets, _, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+
         step = data_iter_step // update_freq
         if step >= num_training_steps_per_epoch:
             continue
@@ -99,6 +108,13 @@ def train_one_epoch(model: torch.nn.Module,
                                                  criterion)
 
         loss_value = loss.item()
+
+        # Softmax to get probabilities (assuming binary classification)
+        probs = F.softmax(output, dim=1)[:, 1]  # Take the prob of positive class
+
+        # Collect for AUC
+        all_probs.append(probs)
+        all_targets.append(targets.view(-1))
 
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))
@@ -137,11 +153,11 @@ def train_one_epoch(model: torch.nn.Module,
         torch.cuda.synchronize()
 
         if mixup_fn is None:
-            class_acc = (output.max(-1)[-1] == targets).float().mean()
+            acc1 = (output.max(-1)[-1] == targets).float().mean()
         else:
-            class_acc = None
+            acc1 = None
         metric_logger.update(loss=loss_value)
-        metric_logger.update(class_acc=class_acc)
+        metric_logger.update(acc1=acc1)
         metric_logger.update(loss_scale=loss_scale_value)
         min_lr = 10.
         max_lr = 0.
@@ -160,7 +176,7 @@ def train_one_epoch(model: torch.nn.Module,
 
         if log_writer is not None:
             log_writer.update(loss=loss_value, head="loss")
-            log_writer.update(class_acc=class_acc, head="loss")
+            log_writer.update(acc1=acc1, head="loss")
             log_writer.update(loss_scale=loss_scale_value, head="opt")
             log_writer.update(lr=max_lr, head="opt")
             log_writer.update(min_lr=min_lr, head="opt")
@@ -171,8 +187,42 @@ def train_one_epoch(model: torch.nn.Module,
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+    all_targets = torch.cat(all_targets)
+    all_probs = torch.cat(all_probs)
+
+    if dist.is_initialized():
+        all_targets_list = [torch.zeros_like(all_targets) for _ in range(dist.get_world_size())]
+        all_probs_list = [torch.zeros_like(all_probs) for _ in range(dist.get_world_size())]
+        dist.all_gather(all_targets_list, all_targets)
+        dist.all_gather(all_probs_list, all_probs)
+
+        all_targets = torch.cat(all_targets_list).cpu().numpy()
+        all_probs = torch.cat(all_probs_list).cpu().numpy()
+
+    # Calculate AUC
+    auc = roc_auc_score(all_targets, all_probs) * 100
+
+    # 计算TP，TN，FP，FN
+    all_preds = (all_probs >= 0.5).astype(int)
+    TP = int(np.sum((all_targets == 1) & (all_preds == 1)))
+    TN = int(np.sum((all_targets == 0) & (all_preds == 0)))
+    FP = int(np.sum((all_targets == 0) & (all_preds == 1)))
+    FN = int(np.sum((all_targets == 1) & (all_preds == 0)))
+
+    if log_writer is not None:
+        log_writer.update(train_AUC=auc, head="loss")
+
+    print("Averaged stats:", metric_logger, "train_AUC:", auc)
+
+    results = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    results['AUC'] = auc
+    results['TP'] = TP
+    results['TN'] = TN
+    results['FP'] = FP
+    results['FN'] = FN
+
+    return results
 
 
 @torch.no_grad()
@@ -185,7 +235,10 @@ def validation_one_epoch(data_loader, model, device):
     # switch to evaluation mode
     model.eval()
 
-    for batch in metric_logger.log_every(data_loader, 10, header):
+    all_targets = []
+    all_probs = []
+
+    for batch in metric_logger.log_every(data_loader, 1, header):
         images = batch[0]
         target = batch[1]
         images = images.to(device, non_blocking=True)
@@ -196,22 +249,55 @@ def validation_one_epoch(data_loader, model, device):
             output = model(images)
             loss = criterion(output, target)
 
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        acc1, _ = accuracy(output, target, topk=(1, 2))
+
+        # Softmax to get probabilities (assuming binary classification)
+        probs = F.softmax(output, dim=1)[:, 1]  # Take the prob of positive class
+
+        # Collect for AUC
+        all_probs.append(probs)
+        all_targets.append(target.view(-1))
 
         batch_size = images.shape[0]
         metric_logger.update(loss=loss.item())
         metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
-        metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    print(
-        '* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
-        .format(
-            top1=metric_logger.acc1,
-            top5=metric_logger.acc5,
-            losses=metric_logger.loss))
 
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    all_targets = torch.cat(all_targets)
+    all_probs = torch.cat(all_probs)
+
+    if dist.is_initialized():
+        all_targets_list = [torch.zeros_like(all_targets) for _ in range(dist.get_world_size())]
+        all_probs_list = [torch.zeros_like(all_probs) for _ in range(dist.get_world_size())]
+        dist.all_gather(all_targets_list, all_targets)
+        dist.all_gather(all_probs_list, all_probs)
+
+        all_targets = torch.cat(all_targets_list).cpu().numpy()
+        all_probs = torch.cat(all_probs_list).cpu().numpy()
+
+    # Calculate AUC
+    auc = roc_auc_score(all_targets, all_probs) * 100
+
+    # 计算TP，TN，FP，FN
+    all_preds = (all_probs >= 0.5).astype(int)
+    TP = int(np.sum((all_targets == 1) & (all_preds == 1)))
+    TN = int(np.sum((all_targets == 0) & (all_preds == 0)))
+    FP = int(np.sum((all_targets == 0) & (all_preds == 1)))
+    FN = int(np.sum((all_targets == 1) & (all_preds == 0)))
+
+    print('* AUC {auc:.3f} Acc@1 {top1.global_avg:.3f} loss {losses.global_avg:.3f}'
+        .format(auc=auc, top1=metric_logger.acc1, losses=metric_logger.loss))
+
+    results = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    results['AUC'] = auc
+    results['TP'] = TP
+    results['TN'] = TN
+    results['FP'] = FP
+    results['FN'] = FN
+
+    return results
 
 
 @torch.no_grad()
@@ -219,13 +305,16 @@ def final_test(data_loader, model, device, file):
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
-    header = 'Test:'
+    header = 'Final Test:'
 
     # switch to evaluation mode
     model.eval()
     final_result = []
 
-    for batch in metric_logger.log_every(data_loader, 10, header):
+    all_targets = []
+    all_probs = []
+
+    for batch in metric_logger.log_every(data_loader, 1, header):
         images = batch[0]
         target = batch[1]
         ids = batch[2]
@@ -247,29 +336,54 @@ def final_test(data_loader, model, device, file):
                 str(int(split_nb[i].cpu().numpy())))
             final_result.append(string)
 
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        acc1, _ = accuracy(output, target, topk=(1, 2))
+
+        # Softmax to get probabilities (assuming binary classification)
+        probs = F.softmax(output, dim=1)[:, 1]  # Take the prob of positive class
+
+        # Collect for AUC
+        all_probs.append(probs)
+        all_targets.append(target.view(-1))
 
         batch_size = images.shape[0]
         metric_logger.update(loss=loss.item())
         metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
-        metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
 
     if not os.path.exists(file):
         os.mknod(file)
     with open(file, 'w') as f:
-        f.write("{}, {}\n".format(acc1, acc5))
+        f.write("{}\n".format(acc1))
         for line in final_result:
             f.write(line)
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    print(
-        '* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
-        .format(
-            top1=metric_logger.acc1,
-            top5=metric_logger.acc5,
-            losses=metric_logger.loss))
 
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    if target.dim() == 0:
+        target = target.unsqueeze(0)
+
+    all_targets = torch.cat(all_targets)
+    all_probs = torch.cat(all_probs)
+
+    if dist.is_initialized():
+        all_targets_list = [torch.zeros_like(all_targets) for _ in range(dist.get_world_size())]
+        all_probs_list = [torch.zeros_like(all_probs) for _ in range(dist.get_world_size())]
+        dist.all_gather(all_targets_list, all_targets)
+        dist.all_gather(all_probs_list, all_probs)
+
+        all_targets = torch.cat(all_targets_list).cpu().numpy()
+        all_probs = torch.cat(all_probs_list).cpu().numpy()
+
+    # Calculate AUC
+    auc = roc_auc_score(all_targets, all_probs) * 100
+
+    print('* AUC {auc:.3f} Acc@1 {top1.global_avg:.3f} loss {losses.global_avg:.3f}'
+        .format(auc=auc, top1=metric_logger.acc1, losses=metric_logger.loss))
+
+    results = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    results['AUC'] = auc
+
+    return results
 
 
 def merge(eval_path, num_tasks, method='prob'):
@@ -308,14 +422,16 @@ def merge(eval_path, num_tasks, method='prob'):
     for i, item in enumerate(dict_feats):
         input_lst.append([i, item, dict_feats[item], dict_label[item]])
     p = Pool(64)
-    # [pred, top1, top5, label]
+    # [pred, top1, label, prob]
     ans = p.map(compute_video, input_lst)
     top1 = [x[1] for x in ans]
-    top5 = [x[2] for x in ans]
-    label = [x[3] for x in ans]
-    final_top1, final_top5 = np.mean(top1), np.mean(top5)
+    label = [x[2] for x in ans]
+    prob = [x[3] for x in ans]
 
-    return final_top1 * 100, final_top5 * 100
+    final_top1= np.mean(top1)
+    final_auc = roc_auc_score(label, prob)
+
+    return final_top1 * 100, final_auc * 100
 
 
 def compute_video(lst):
@@ -324,5 +440,5 @@ def compute_video(lst):
     feat = np.mean(feat, axis=0)
     pred = np.argmax(feat)
     top1 = (int(pred) == int(label)) * 1.0
-    top5 = (int(label) in np.argsort(-feat)[:5]) * 1.0
-    return [pred, top1, top5, int(label)]
+    prob = feat[1]
+    return [pred, top1, label, prob]
